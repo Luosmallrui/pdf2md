@@ -1,16 +1,18 @@
 import json
 import os
+import re
 from base64 import b64encode
 from glob import glob
 from io import StringIO
 import tempfile
 from typing import Tuple, Union
-
+from elasticsearch import Elasticsearch
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from loguru import logger
-
+from openai import OpenAI
+import hashlib
 from magic_pdf.data.read_api import read_local_images, read_local_office
 import magic_pdf.model as model_config
 from magic_pdf.config.enums import SupportedPdfParseMethod
@@ -26,10 +28,11 @@ from fastapi import Form
 model_config.__use_inside_model__ = True
 
 app = FastAPI()
-
+es = Elasticsearch("http://localhost:9200")
 pdf_extensions = [".pdf"]
 office_extensions = [".ppt", ".pptx", ".doc", ".docx"]
 image_extensions = [".png", ".jpg", ".jpeg"]
+
 
 class MemoryDataWriter(DataWriter):
     def __init__(self):
@@ -52,10 +55,10 @@ class MemoryDataWriter(DataWriter):
 
 
 def init_writers(
-    file_path: str = None,
-    file: UploadFile = None,
-    output_path: str = None,
-    output_image_path: str = None,
+        file_path: str = None,
+        file: UploadFile = None,
+        output_path: str = None,
+        output_image_path: str = None,
 ) -> Tuple[
     Union[S3DataWriter, FileBasedDataWriter],
     Union[S3DataWriter, FileBasedDataWriter],
@@ -73,7 +76,7 @@ def init_writers(
     Returns:
         Tuple[writer, image_writer, file_bytes]: Returns initialized writer tuple and file content
     """
-    file_extension:str = None
+    file_extension: str = None
     if file_path:
         is_s3_path = file_path.startswith("s3://")
         if is_s3_path:
@@ -112,10 +115,10 @@ def init_writers(
 
 
 def process_file(
-    file_bytes: bytes,
-    file_extension: str,
-    parse_method: str,
-    image_writer: Union[S3DataWriter, FileBasedDataWriter],
+        file_bytes: bytes,
+        file_extension: str,
+        parse_method: str,
+        image_writer: Union[S3DataWriter, FileBasedDataWriter],
 ) -> Tuple[InferenceResult, PipeResult]:
     """
     Process PDF file content
@@ -177,15 +180,15 @@ def encode_image(image_path: str) -> str:
     summary="Parse files (supports local files and S3)",
 )
 async def file_parse(
-    file: UploadFile = None,
-    file_path: str = Form(None),
-    parse_method: str = Form("auto"),
-    is_json_md_dump: bool = Form(False),
-    output_dir: str = Form("output"),
-    return_layout: bool = Form(False),
-    return_info: bool = Form(False),
-    return_content_list: bool = Form(False),
-    return_images: bool = Form(False),
+        file: UploadFile = None,
+        file_path: str = Form(None),
+        parse_method: str = Form("auto"),
+        is_json_md_dump: bool = Form(False),
+        output_dir: str = Form("output"),
+        return_layout: bool = Form(False),
+        return_info: bool = Form(False),
+        return_content_list: bool = Form(False),
+        return_images: bool = Form(False),
 ):
     """
     Execute the process of converting PDF to JSON and MD, outputting MD and JSON files
@@ -209,7 +212,7 @@ async def file_parse(
     """
     try:
         if (file is None and file_path is None) or (
-            file is not None and file_path is not None
+                file is not None and file_path is not None
         ):
             return JSONResponse(
                 content={"error": "Must provide either file or file_path"},
@@ -244,9 +247,39 @@ async def file_parse(
         pipe_result.dump_md(md_content_writer, "", "images")
         pipe_result.dump_middle_json(middle_json_writer, "")
 
+        es = new_es_client()
+
         # Get content
         content_list = json.loads(content_list_writer.get_value())
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "title": {"type": "text"},
+                    "raw_md": {"type": "text"},
+                    "plain_text": {"type": "text"},
+                    "keywords": {"type": "keyword"},
+                    "summary": {"type": "text"},
+                    "category": {"type": "keyword"},
+                    "timestamp": {"type": "date"}
+                }
+            }
+        }
+        if not es.indices.exists(index="markdown_docs"):
+            es.indices.create(index="markdown_docs", body=mapping)
         md_content = md_content_writer.get_value()
+        doc_id = hashlib.sha256(file_name.encode('utf-8')).hexdigest()
+
+        doc = {
+            "title": f"{file_name}",
+            "content": md_content,
+        }
+        # 使用相同 ID 进行索引，存在则更新，不存在则创建
+        res = es.index(
+            index="markdown_docs",
+            id=doc_id,
+            document=doc
+        )
+        Parse(file_name)
         middle_json = json.loads(middle_json_writer.get_value())
         model_json = infer_result.get_infer_res()
 
@@ -299,6 +332,97 @@ async def file_parse(
     except Exception as e:
         logger.exception(e)
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+def new_es_client():
+    # 等价于 elastic.SetURL("http://0.0.0.0:9200")
+    es = Elasticsearch("http://localhost:9200")  # 或者 "http://0.0.0.0:9200"
+    if not es.ping():
+        raise ValueError("Elasticsearch connection failed")
+    return es
+
+
+def fetch_doc(title):
+    doc_id = hashlib.sha256(title.encode('utf-8')).hexdigest()
+
+    # 直接通过 ID 获取文档
+    res = es.get(index="markdown_docs", id=doc_id)
+    if not res:
+        return None
+    return res
+
+
+def call_openai(prompt, model="deepseek-ai/DeepSeek-V2.5"):
+    client = OpenAI(
+        base_url='https://api.siliconflow.cn/v1',
+        api_key='sk-zhxeidatuglqramhktwnkguzmcmtxlkdjhcuqjtrdbfyngrk'
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        stream=False  # 这里不需要流式输出，简单演示
+    )
+    # 取第一个完整回答文本
+    return response.choices[0].message.content
+
+
+def Parse(title):
+    hit = fetch_doc(title)
+    if not hit:
+        print("文档不存在")
+        return
+    doc_id = hit["_id"]
+    source = hit["_source"]
+    content = source.get("content", "")
+
+    # 关键词提取
+    prompt_kw = f"""请从以下文档内容中提取5~10个最重要的主题关键词，返回格式为JSON数组：
+
+内容：
+\"\"\"
+{content}
+\"\"\"
+"""
+    keywords_json = call_openai(prompt_kw)
+
+    # 内容摘要
+    prompt_summary = f"""请为以下文档内容生成一段简洁的摘要，控制在100字以内：
+
+内容：
+\"\"\"
+{content}
+\"\"\"
+"""
+    summary = call_openai(prompt_summary)
+
+    # 文档归类（学术论文、电子书、其他）
+    prompt_category = f"""请根据以下文档内容，判断该文档属于下面哪个类别，直接返回类别名称：
+- 学术论文
+- 电子书
+- 其他
+
+内容：
+\"\"\"
+{content}
+\"\"\"
+"""
+    category = call_openai(prompt_category)
+    cleaned = re.sub(r"```json|```", "", keywords_json).strip()
+    keywords_list = json.loads(cleaned)  # 变成 Python list
+    # 更新 ES 文档
+    update_fields = {
+        "keywords": keywords_list,
+        "summary": summary,
+        "category": category
+    }
+    update_doc("markdown_docs", doc_id, update_fields)
+
+    print(f"更新成功，关键词：{keywords_list}\n摘要：{summary}\n分类：{category}")
+
+
+def update_doc(index, doc_id, fields):
+    es.update(index=index, id=doc_id, body={"doc": fields})
 
 
 if __name__ == "__main__":
